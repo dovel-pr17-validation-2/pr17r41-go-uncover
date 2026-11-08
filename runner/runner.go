@@ -1,0 +1,149 @@
+package runner
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/uncover"
+	"github.com/projectdiscovery/uncover/sources"
+	"github.com/projectdiscovery/utils/errkit"
+	stringsutil "github.com/projectdiscovery/utils/strings"
+)
+
+// Runner is an instance of the uncover enumeration
+// client used to orchestrate the whole process.
+type Runner struct {
+	options      *Options
+	service      *uncover.Service
+	outputWriter *OutputWriter
+}
+
+// NewRunner creates a new runner struct instance by parsing
+// the configuration options, configuring sources, reading lists
+// and setting up loggers, etc.
+func NewRunner(options *Options) (*Runner, error) {
+	runner := &Runner{options: options}
+	appendAllQueries(options)
+
+	engineList := options.Engine
+	if options.CheckCredits && len(options.Engine) == 0 {
+		engineList = uncover.AllBalanceAgents()
+	}
+
+	opts := uncover.Options{
+		Agents:  engineList,
+		Queries: options.Query,
+		Limit:   options.Limit,
+		Proxy:   options.Proxy,
+	}
+	service, err := uncover.New(&opts)
+	if err != nil {
+		return nil, err
+	}
+	runner.service = service
+
+	runner.outputWriter, err = NewOutputWriter()
+	if err != nil {
+		return nil, err
+	}
+
+	if !options.Verbose {
+		runner.outputWriter.AddWriters(os.Stdout)
+	}
+	if runner.options.OutputFile != "" {
+		outputFile, err := os.Create(runner.options.OutputFile)
+		if err != nil {
+			return nil, errkit.Newf("could not create output file %s: %s", options.OutputFile, err)
+		}
+		runner.outputWriter.AddWriters(outputFile)
+	}
+	return runner, nil
+}
+
+// Run runs the subdomain enumeration flow or credit balance check
+func (r *Runner) Run(ctx context.Context) error {
+	if r.options.CheckCredits {
+		return r.CheckCredits(ctx)
+	}
+
+	// CSV is only the effective format when no higher-precedence output mode
+	// (JSON/Raw) is set; otherwise skip the header so we don't emit a stray row.
+	csvOutput := r.options.CSV && !r.options.JSON && !r.options.Raw
+	var csvFields []string
+	if csvOutput {
+		csvFields = parseFields(r.options.OutputFields)
+		r.outputWriter.WriteCSVRow(csvFields)
+	}
+
+	resultCallback := func(result sources.Result) {
+		optionFields := r.options.OutputFields
+		switch {
+		case result.Error != nil:
+			gologger.Warning().Label(result.Source).Msgf("%s\n", result.Error.Error())
+		case r.options.JSON:
+			gologger.Verbose().Label(result.Source).Msgf("%s\n", result.JSON())
+			r.outputWriter.WriteJsonData(result)
+		case r.options.Raw:
+			gologger.Verbose().Label(result.Source).Msgf("%s\n", result.RawData())
+			r.outputWriter.WriteString(result.RawData())
+		case csvOutput:
+			if r.options.Verbose {
+				gologger.Verbose().Label(result.Source).Msgf("%s\n", strings.Join(getFieldValues(result, csvFields), ","))
+			}
+			r.outputWriter.WriteCSVData(result, csvFields)
+		default:
+			port := fmt.Sprint(result.Port)
+			replacer := strings.NewReplacer(
+				"ip", result.IP,
+				"host", result.Host,
+				"port", port,
+				"url", result.Url,
+			)
+			if (result.IP == "" || port == "0") && stringsutil.ContainsAny(r.options.OutputFields, "ip", "port") {
+				optionFields = "host"
+			}
+			outData := replacer.Replace(optionFields)
+			searchFor := []string{result.IP, port}
+			if result.Host != "" || r.options.OutputFile != "" {
+				searchFor = append(searchFor, result.Host)
+			}
+			if stringsutil.ContainsAny(outData, searchFor...) && !r.outputWriter.findDuplicate(outData, false) {
+				if r.options.Verbose {
+					gologger.Info().Label(result.Source).Msg(outData)
+				}
+				r.outputWriter.WriteString(outData)
+			}
+		}
+	}
+	return r.service.ExecuteWithCallback(ctx, resultCallback)
+}
+
+// CheckCredits queries account remaining credits across configured search engine providers
+func (r *Runner) CheckCredits(ctx context.Context) error {
+	allProvidersMode := len(r.options.Engine) == 0
+	balanceCallback := func(balance *sources.AccountBalance) {
+		if r.options.JSON {
+			data, err := json.Marshal(balance)
+			if err == nil {
+				gologger.Silent().Msg(string(data))
+				r.outputWriter.WriteString(string(data))
+			}
+		} else {
+			msg := fmt.Sprintf("[%s] %s", balance.Engine, balance.String())
+			gologger.Info().Msg(msg)
+			r.outputWriter.WriteString(msg)
+		}
+	}
+	return r.service.ExecuteCheckCredits(ctx, allProvidersMode, balanceCallback)
+}
+
+// Close closes its resources
+func (r *Runner) Close() {
+	if r.outputWriter != nil {
+		r.outputWriter.Close()
+	}
+}
